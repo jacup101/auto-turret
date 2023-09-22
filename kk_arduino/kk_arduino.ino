@@ -11,9 +11,9 @@ void pulse(int pulse_dur) {
   if (!spin) {
     return;
   }
-  digitalWrite(7, HIGH);
+  digitalWrite(8, HIGH);
   delay(pulse_dur);
-  digitalWrite(7, LOW);
+  digitalWrite(8, LOW);
   delay(pulse_dur);
 }
 
@@ -22,10 +22,10 @@ void loop() {
     if (Serial.available()) {
       int dir = Serial.read();
       if (dir == 'l') {
-        digitalWrite(8, HIGH);
+        digitalWrite(7, HIGH);
         spin = true;
       } else if (dir == 'r') {
-        digitalWrite(8, LOW);
+        digitalWrite(7, LOW);
         spin = true;
       } else {
         spin = false;
