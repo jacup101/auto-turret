@@ -1,15 +1,38 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "DRV8834.h"
+#include <string.h>
 
-#define RX_BUF_SZ 20
+#define RX_BUF_SZ 16
+
 uint8_t RX_BUF[RX_BUF_SZ];
-uint8_t command;
+uint8_t speed;
+int16_t step_counter;
+
+typedef struct {
+	char command;
+	uint8_t argument;
+} command_struct;
 
 UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_rx;
 
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
+
+osMutexId_t stepMutexHandle;
+const osMutexAttr_t stepMutex_attributes = {
+  .name = "stepMutex"
+};
+
+osSemaphoreId_t commandSemaphoreHandle;
+const osSemaphoreAttr_t commandSemaphore_attributes = {
+  .name = "commandSemaphore"
+};
+
+osMessageQueueId_t commandQueueHandle;
+const osMessageQueueAttr_t commandQueue_attributes = {
+		.name = "commandQueue"
+};
 
 osThreadId_t blinkLEDHandle;
 const osThreadAttr_t blinkLED_attributes = {
@@ -17,24 +40,36 @@ const osThreadAttr_t blinkLED_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
-/* Definitions for Step */
-osThreadId_t StepHandle;
-const osThreadAttr_t Step_attributes = {
-  .name = "Step",
+
+osThreadId_t parseCommandHandle;
+const osThreadAttr_t parseCommand_attributes = {
+  .name = "parseCommand",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityHigh,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 
+osThreadId_t driverStepHandle;
+const osThreadAttr_t driverStep_attributes = {
+  .name = "driverStep",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+//function declarations
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 void StartBlinkLED(void *argument);
-void StartStep(void *argument);
+void parseCommand(void *argument);
+void driverStep(void *argument);
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
-	command = RX_BUF[0];
+	command_struct cmd;
+	cmd.command = RX_BUF[0];
+	cmd.argument = RX_BUF[1];
+	osMessageQueuePut(commandQueueHandle, &cmd, 0, 0);
 	HAL_UARTEx_ReceiveToIdle_DMA(&huart3, RX_BUF, RX_BUF_SZ);
 }
 
@@ -47,19 +82,27 @@ int main(void) {
   MX_DMA_Init();
   MX_USART3_UART_Init();
   MX_USB_OTG_FS_PCD_Init();
-  //set DMA to generate interrupt upon full/idle
+
+  //set DMA to generate interrupt upon full buffer/idle
   HAL_UARTEx_ReceiveToIdle_DMA(&huart3, RX_BUF, RX_BUF_SZ);
 
-  /* Disable half-full DMA interrupt */
+  //Disable half-full DMA interrupt
   __HAL_DMA_DISABLE_IT(&hdma_usart3_rx, DMA_IT_HT);
+
+  //
   osKernelInitialize();
 
-  blinkLEDHandle = osThreadNew(StartBlinkLED, NULL, &blinkLED_attributes);
+  stepMutexHandle = osMutexNew(&stepMutex_attributes);
+  commandSemaphoreHandle = osSemaphoreNew(1, 0, &commandSemaphore_attributes);
 
-  /* creation of Step */
-  StepHandle = osThreadNew(StartStep, NULL, &Step_attributes);
+  commandQueueHandle = osMessageQueueNew (16, sizeof(command_struct), &commandQueue_attributes);
+  blinkLEDHandle = osThreadNew(StartBlinkLED, NULL, &blinkLED_attributes);
+  parseCommandHandle = osThreadNew(parseCommand, NULL, &parseCommand_attributes);
+  driverStepHandle = osThreadNew(driverStep, NULL, &driverStep_attributes);
+
   osKernelStart();
 
+  //main loop
   while (1) {
   }
 }
@@ -115,14 +158,6 @@ void SystemClock_Config(void)
 }
 
 static void MX_USART3_UART_Init(void) {
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
   huart3.Init.BaudRate = 115200;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
@@ -247,37 +282,64 @@ static void MX_GPIO_Init(void)
 }
 
 void StartBlinkLED(void *argument) {
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
   for(;;)
   {
   	HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);
     osDelay(500);
   }
   osThreadTerminate(NULL);
-  /* USER CODE END 5 */
 }
 
-void StartStep(void *argument)
-{
-	DRV8834_wake();
+void parseCommand(void *argument) {
+	command_struct cmd;
   for(;;)
   {
-  	if (command == 'l') {
-  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
-  		DRV8834_set_dir(command);
+  	osMessageQueueGet(commandQueueHandle, &cmd, NULL, osWaitForever);
+  	osMutexAcquire(stepMutexHandle, osWaitForever);
+  	if (cmd.command == 'l') {
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+			DRV8834_set_dir('l');
+			step_counter = cmd.argument;
+		} else if (cmd.command == 'r') {
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+			DRV8834_set_dir('r');
+			step_counter = cmd.argument;
+		} else if (cmd.command == 's') {
+			speed = cmd.argument;
+		} else {
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+			step_counter = 0;
+		}
+  	osMutexRelease(stepMutexHandle);
+  	osSemaphoreRelease(commandSemaphoreHandle);
+  }
+  osThreadTerminate(NULL);
+}
+
+//
+void driverStep(void *argument)
+{
+	DRV8834_wake();
+	speed = 15;
+	step_counter = 0;
+  for(;;)
+  {
+  	//wait for a new command to be parsed
+  	osSemaphoreAcquire(commandSemaphoreHandle, osWaitForever);
+  	osMutexAcquire(stepMutexHandle, osWaitForever);
+
+  	for (int i = 0; i < step_counter; i++) {
   		DRV8834_step();
-  	} else if (command == 'r') {
-  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
-  		DRV8834_set_dir(command);
-  		DRV8834_step();
-  	} else {
-  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-  		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+  		osDelay(speed);
   	}
-    osDelay(10);
+
+  	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+  	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+
+  	osMutexRelease(stepMutexHandle);
   }
   osThreadTerminate(NULL);
 }
